@@ -45,6 +45,7 @@ import { dropStatusDrawersForProfile, migrateStatusDrawersForProfile } from './c
 import { registryConnectionKind } from './connection-registry-state'
 import { dropDesktopMetricsForProfile, migrateDesktopMetricsForProfile, recordDislike } from './desktop-metrics'
 import { dialedGatewayModeFor } from './gateway'
+import { type LiveTurnStatusResponse, liveTurnVerdict, type LiveTurnVerdict } from './live-turn-verdict'
 import {
   adoptPendingRuntimeTabs,
   dropPreviewTabsForProfile,
@@ -58,6 +59,7 @@ import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { renameLocalOwnerRoute } from './profile-owner-rename'
 import { $projectTree } from './project-tree'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
+import { clearQueuedPromptBubbles, forgetQueuedPrompts } from './queued-prompt-bubbles'
 import {
   $activeSessionId,
   $connection,
@@ -221,6 +223,8 @@ export function liveSessionScopes(): Set<string> {
 
   return scopes
 }
+
+export { liveTurnVerdict, type LiveTurnVerdict } from './live-turn-verdict'
 
 // The owner hold itself (the map, TTL, hold/release/reset, and the
 // foreground-scope sweep) lives in ./session-owner-holds; re-exported here
@@ -400,32 +404,6 @@ function clearEventSilence(runtimeId: string) {
 
 export function isLiveTurnAwaitingEvents(state: ClientSessionState | undefined): boolean {
   return Boolean(state && (state.busy || state.awaitingResponse || state.turnLive) && !state.needsInput)
-}
-
-export type LiveTurnVerdict = 'ended' | 'running' | 'unknown'
-
-interface LiveTurnStatusResponse {
-  sessions?: { id?: string; status?: string }[]
-}
-
-/** What one `session.active_list` snapshot says about `runtimeId`'s turn. A
- *  runtime missing from a well-formed list has been reaped: its turn is over.
- *  `starting` is an agent build for a turn the backend accepted. */
-export function liveTurnVerdict(
-  response: LiveTurnStatusResponse | null | undefined,
-  runtimeId: string
-): LiveTurnVerdict {
-  if (!Array.isArray(response?.sessions)) {
-    return 'unknown'
-  }
-
-  const status = response.sessions.find(session => session.id?.trim() === runtimeId)?.status
-
-  if (status === undefined || status === 'idle') {
-    return 'ended'
-  }
-
-  return status === 'starting' || status === 'waiting' || status === 'working' ? 'running' : 'unknown'
 }
 
 async function checkLiveTurn(runtimeId: string): Promise<LiveTurnVerdict> {
@@ -976,6 +954,8 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearEventSilence(runtimeId)
   clearSessionProviderWait(runtimeId)
+  // A prompt kept for a queued admission's start on this runtime would never be drawn now.
+  forgetQueuedPrompts(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
   sessionOwnerByRuntimeId.delete(runtimeId)
   // A runtime that never bound a stored id never will now (#73890).
@@ -1013,6 +993,7 @@ export function clearAllSessionStates() {
   settledExpiry.clear()
   unconfirmedReconnectSettles.clear()
   clearAllProviderWaits()
+  clearQueuedPromptBubbles()
   sessionScopeByRuntimeId.clear()
   sessionOwnerByRuntimeId.clear()
   forgetPendingRuntimeTabs()

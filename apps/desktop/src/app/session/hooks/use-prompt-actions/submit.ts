@@ -28,6 +28,7 @@ import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
 import { trackPendingSubmission } from '@/store/pending-submissions'
+import { deferQueuedPrompt, withQueuedPrompt } from '@/store/queued-prompt-bubbles'
 import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $activeSessionId,
@@ -212,6 +213,48 @@ function isPreAdmissionRefusal(error: unknown): boolean {
   const { code, message } = error as { code?: unknown; message?: unknown }
 
   return code === 4094 || (code === 4000 && typeof message === 'string' && /submission_id/.test(message))
+}
+
+interface QueuedPromptReceipt {
+  buildUserMessage: () => ChatMessage
+  hidden: boolean
+  queueAdmission: boolean
+  receiptSessionId: string
+  result: SubmitReceipt
+  storedSessionId?: string | null
+  submissionId: string
+  updateSessionState: SubmitPromptDeps['updateSessionState']
+}
+
+/** Keep a queue admission's prompt for its own start (store/queued-prompt-bubbles.ts), or draw it now when that start
+ *  already beat the receipt. Hidden sends and receipts that start no turn keep nothing. */
+function drawQueuedPromptAtReceipt({
+  buildUserMessage,
+  hidden,
+  queueAdmission,
+  receiptSessionId,
+  result,
+  storedSessionId,
+  submissionId,
+  updateSessionState
+}: QueuedPromptReceipt): void {
+  if (!queueAdmission || hidden || (result.status !== 'queued' && result.status !== 'started')) {
+    return
+  }
+
+  const startedPrompt = deferQueuedPrompt(receiptSessionId, result.admission_id ?? submissionId, buildUserMessage())
+
+  if (startedPrompt) {
+    updateSessionState(
+      receiptSessionId,
+      state => {
+        const messages = withQueuedPrompt(state.messages, startedPrompt, state.turnAnchorId)
+
+        return messages === state.messages ? state : { ...state, messages, turnAnchorId: startedPrompt.id }
+      },
+      storedSessionId
+    )
+  }
 }
 
 export function useSubmitPrompt(deps: SubmitPromptDeps) {
@@ -1262,6 +1305,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 text,
                 displayText: options?.displayText,
                 status: result.status
+              })
+
+              // A queue admission drew no bubble (seedOptimistic): its card stands for it while it waits. Its
+              // prompt is drawn when its own turn starts, or right now when that start beat this receipt.
+              drawQueuedPromptAtReceipt({
+                buildUserMessage,
+                hidden: options?.displayKind === 'hidden',
+                queueAdmission,
+                receiptSessionId,
+                result,
+                storedSessionId: targetStoredSessionId,
+                submissionId,
+                updateSessionState
               })
 
               // Queued is also the initial receipt for an idle session's first

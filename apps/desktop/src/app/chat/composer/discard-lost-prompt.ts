@@ -1,5 +1,15 @@
 import type { GatewayRequest } from '@/app/session/hooks/use-prompt-actions/utils'
+import { dropQueuedPrompt } from '@/store/queued-prompt-bubbles'
 import { requestForOwnedSession } from '@/store/session-states'
+
+/** The owner accepted an outcome in which `admissionId` never starts as its own turn: forget the prompt this window
+ *  kept to draw at that start (store/queued-prompt-bubbles.ts). A refusal leaves it queued, and kept. */
+async function retiring<T>(admissionId: string, outcome: Promise<T>): Promise<T> {
+  const result = await outcome
+  dropQueuedPrompt(admissionId)
+
+  return result
+}
 
 export async function discardLostPrompt(
   sessionId: string | null | undefined,
@@ -11,10 +21,13 @@ export async function discardLostPrompt(
 
   // The owning socket's canonical protocol supplies the UNKNOWN admission's
   // generation. The current live execution generation may already be newer.
-  return requestForOwnedSession(queueSessionKey, request, 'prompt.resolve_unknown', {
-    session_id: targetSessionId,
-    admission_id: admissionId
-  })
+  return retiring(
+    admissionId,
+    requestForOwnedSession(queueSessionKey, request, 'prompt.resolve_unknown', {
+      session_id: targetSessionId,
+      admission_id: admissionId
+    })
+  )
 }
 
 /** Withdraw a server-queued admission. The authority settles every waiter and its pending fanout
@@ -26,10 +39,13 @@ export async function cancelQueuedPrompt(
   admissionId: string,
   request: GatewayRequest
 ): Promise<unknown> {
-  return requestForOwnedSession(queueSessionKey, request, 'prompt.cancel', {
-    session_id: sessionId ?? queueSessionKey,
-    admission_id: admissionId
-  })
+  return retiring(
+    admissionId,
+    requestForOwnedSession(queueSessionKey, request, 'prompt.cancel', {
+      session_id: sessionId ?? queueSessionKey,
+      admission_id: admissionId
+    })
+  )
 }
 
 /** Deliver a server-queued admission as a steer into the running turn. The authority consumes the
@@ -41,10 +57,13 @@ export async function steerQueuedPrompt(
   admissionId: string,
   request: GatewayRequest
 ): Promise<unknown> {
-  return requestForOwnedSession(queueSessionKey, request, 'prompt.steer_queued', {
-    session_id: sessionId ?? queueSessionKey,
-    admission_id: admissionId
-  })
+  return retiring(
+    admissionId,
+    requestForOwnedSession(queueSessionKey, request, 'prompt.steer_queued', {
+      session_id: sessionId ?? queueSessionKey,
+      admission_id: admissionId
+    })
+  )
 }
 
 /** Replace a server-queued admission with edited text: the authority cancels it and admits the
@@ -58,10 +77,13 @@ export async function replaceQueuedPrompt(
   submissionId: string,
   request: GatewayRequest
 ): Promise<unknown> {
-  return requestForOwnedSession(queueSessionKey, request, 'prompt.replace_queued', {
-    session_id: sessionId ?? queueSessionKey,
-    admission_id: admissionId,
-    submission_id: submissionId,
-    text
-  })
+  return retiring(
+    admissionId,
+    requestForOwnedSession(queueSessionKey, request, 'prompt.replace_queued', {
+      session_id: sessionId ?? queueSessionKey,
+      admission_id: admissionId,
+      submission_id: submissionId,
+      text
+    })
+  )
 }

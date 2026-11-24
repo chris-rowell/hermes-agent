@@ -17,6 +17,7 @@ import { continueReplyPause, endContinuedReplyPause, markReplyPaused } from '@/s
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { clearAllPrompts } from '@/store/prompts'
 import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
+import { takeQueuedPrompt, withQueuedPrompt } from '@/store/queued-prompt-bubbles'
 import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
 import { refreshSupportedSessionControlAfterTurn } from '@/store/session-control'
 import { $focusedStoredSessionId } from '@/store/session-focus'
@@ -198,6 +199,15 @@ function handleMessageStart(ctx: GatewayEventContext): boolean {
     console.debug('[turn-accept-latency]', { sessionId, ms: Date.now() - seededAt })
   }
 
+  // A prompt this window sent through the server queue has no bubble yet (its queue card stood for it): this
+  // admission's start is where it becomes the turn's first row (store/queued-prompt-bubbles.ts). A start the user's
+  // Stop already overrode (`interrupted`, below) arms nothing, so it drops the kept prompt instead of drawing it.
+  const queuedPrompt = takeQueuedPrompt(
+    sessionId,
+    ctx.event.admission_id,
+    !sessionStateByRuntimeIdRef.current.get(sessionId)?.interrupted
+  )
+
   updateSessionState(sessionId, state => {
     // If the user clicked Stop (cancelRun set interrupted=true), don't
     // let a stale message.start from a chained turn (goal follow-up,
@@ -213,7 +223,10 @@ function handleMessageStart(ctx: GatewayEventContext): boolean {
     // A projected queued prompt drawn before this start is this turn's
     // prompt from here on, even while its row is still on screen. A stopped
     // reply with nothing visible after it is the reply this turn goes on with.
-    const messages = continueStoppedReply(markQueuedPromptStarted(state.messages), payload)
+    const messages = continueStoppedReply(
+      markQueuedPromptStarted(queuedPrompt ? withQueuedPrompt(state.messages, queuedPrompt, null) : state.messages),
+      payload
+    )
 
     return {
       ...state,
