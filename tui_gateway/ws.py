@@ -9,6 +9,7 @@ import asyncio
 import collections
 import contextlib
 import concurrent.futures
+import functools
 import json
 import logging
 import socket
@@ -107,6 +108,25 @@ _WS_CONCURRENT_READ_METHODS = frozenset({"session.context_breakdown", "session.t
 _WS_CONCURRENT_READ_LIMIT = 2
 # Reads admitted beyond the running ones; one more parks the reader (as the serial lane did).
 _WS_WAITING_READ_LIMIT = 8
+# A manual compression (canonical ``session.mutate`` operation ``compress``) awaits its summary call, an
+# LLM request that often outlasts the client's 30 s request deadline. On the serial lane every later
+# control on the socket waited behind it: other chats' resume, ``session.control.read``, sends, the
+# legacy liveness ``ping``, edits of other chats (#159239, #145737). It leaves the lane instead and
+# starts a chain for its session (by ``params.session_id``). While that chain holds a frame, every
+# later frame naming the same session joins it behind, in arrival order (a rename or a model pick,
+# a send, an interrupt), except the reads below, so a same-session edit cannot commit under the
+# compression and turn its commit into a ``revision_conflict``. That ordering is best-effort: a frame
+# naming the session another way (a lineage sibling, another socket) is not held, and the session's
+# own guards (claim_gate, mutation_lock, the commit's revision/generation fences in
+# gateway/session_mutations.py) stay what keeps the store consistent. Every other frame, a mutation of
+# another session included, stays on the serial lane; a compression of another session starts that
+# session's own chain, so two chats' summaries do not wait for each other.
+_WS_CHAIN_EXEMPT_READ_METHODS = frozenset({"session.control.read", "approval.pending", "process.list",
+                                           "subagent.list", "subagent.tail"})
+# Chained frames not yet finished, across every session and counting the running compressions; the
+# frame that would exceed it parks the serial lane until a chained frame finishes (as the serial lane
+# parked behind a busy handler).
+_WS_MUTATION_CHAIN_LIMIT = 32
 # A shared socket's frame naming a profile hot-serve is still starting (a chat opened on a profile
 # created a moment ago) waits for that start in a lane of its own: on the serial lane every later
 # control on the socket, other profiles' prompts and interrupts included, would queue behind it.
@@ -481,6 +501,11 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
     # leaves, so a start that ends a moment later (before the lane resumes) cannot run them.
     held_waiting: dict[str, asyncio.Event] = {}
     held_dropped: set[str] = set()
+    # Frames off the serial lane behind a pending compression: the last chained frame per session (each
+    # waits for the one before it in its session, so the session is chained until its last one ends),
+    # and every chained frame not yet finished, for the limit and the teardown.
+    session_chains: dict[str, asyncio.Task] = {}
+    chained: set[asyncio.Task] = set()
 
     def _client_left() -> None:
         """At the disconnect, with no yield: drop every lane whose start has not ended yet. A lane that
@@ -601,6 +626,66 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         step.cancel()
         return stop
 
+    def _chained_session(req: Any) -> str | None:
+        params = req.get("params") if isinstance(req, dict) else None
+        session_id = params.get("session_id") if isinstance(params, dict) else None
+        return session_id if isinstance(session_id, str) and session_id else None
+
+    def _chain_for(req: Any, req_method: Any) -> str | None:
+        """The session whose chain *req* joins, or None for the serial lane. A compression starts its
+        session's chain; while that chain holds a frame, every frame naming the session joins it (the
+        exempt reads excepted). A frame for any other session, or without a usable ``session_id`` (the
+        contract refuses those at once), stays on the lane."""
+        session_id = _chained_session(req)
+        if session_id is None:
+            return None
+        last = session_chains.get(session_id)
+        if last is not None and not last.done():
+            return None if req_method in _WS_CHAIN_EXEMPT_READ_METHODS else session_id
+        if req_method == "session.mutate" and req["params"].get("operation") == "compress":
+            return session_id
+        return None
+
+    async def _dispatch_chained(req: Any, previous: asyncio.Task | None) -> None:
+        if previous is not None:
+            await asyncio.wait({previous})  # its outcome is its own; this frame only follows it
+        if send_failed.done():
+            return  # a reply already failed: the reader stopped, as the serial lane stops dispatching
+        try:
+            await _dispatch_one(req)
+        except _SendFailed:
+            # A failed reply ends the reader, never by cancelling the serial lane's handler.
+            if not send_failed.done():
+                send_failed.set_result(None)
+            raise
+
+    def _finish_chained(session_id: str, task: asyncio.Task) -> None:
+        # Here, not in the task: a task cancelled before its first step never runs its body.
+        chained.discard(task)
+        if session_chains.get(session_id) is task:
+            del session_chains[session_id]
+        with contextlib.suppress(asyncio.CancelledError, _SendFailed):
+            task.result()
+
+    async def _chain_request(req: Any, session_id: str) -> None:
+        while len(chained) >= _WS_MUTATION_CHAIN_LIMIT:
+            # A flood parks the lane, as the serial lane did, until a chained frame finishes.
+            await asyncio.wait(chained, return_when=asyncio.FIRST_COMPLETED)
+            chained.difference_update([frame for frame in chained if frame.done()])
+        task = asyncio.create_task(_dispatch_chained(req, session_chains.get(session_id)))
+        session_chains[session_id] = task
+        chained.add(task)
+        task.add_done_callback(functools.partial(_finish_chained, session_id))
+
+    async def _end_chain() -> None:
+        """Chained frames read before a hang-up finish, as the serial lane finishes its queue, unless the
+        connection itself was cancelled (server shutdown; a mutation's own task keeps running shielded)."""
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            for frame in chained:
+                frame.cancel()
+        await asyncio.gather(*chained, return_exceptions=True)
+
     async def _dispatch_loop() -> None:
         """Dispatch controls in arrival order; bounded expensive read-only projections run alongside them."""
         while (req := await _next_request()) is not stop:
@@ -611,6 +696,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 task.add_done_callback(_finish_concurrent_read)
                 continue
             if await _hold_for_profile_start(req):
+                continue
+            if (session_id := _chain_for(req, req_method)) is not None:
+                await _chain_request(req, session_id)
                 continue
             await _dispatch_one(req)
 
@@ -739,6 +827,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 _log.error("ws dispatcher failed peer=%s", peer, exc_info=failure)
         await _end_reads()
         await _end_held()
+        await _end_chain()
         if authority_connection is not None:
             # After the dispatcher drained: an in-flight authority call must not see its connection closed.
             await authority_connection.close()
